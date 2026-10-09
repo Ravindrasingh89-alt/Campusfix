@@ -1,13 +1,116 @@
-import { useEffect, useState } from 'react'
+import { Component, useEffect, useRef, useState } from 'react'
 import {
   onAuthStateChanged, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut,
   sendEmailVerification, sendPasswordResetEmail,
 } from 'firebase/auth'
-import { collection, addDoc, doc, setDoc, updateDoc, deleteDoc, onSnapshot, query, where, serverTimestamp } from 'firebase/firestore'
+import {
+  collection, addDoc, doc, setDoc, updateDoc, deleteDoc, onSnapshot, query, where, serverTimestamp,
+  arrayUnion, arrayRemove, increment,
+} from 'firebase/firestore'
 import { auth, db, uploadPhoto, CATEGORIES, DEPT, STATUSES } from './firebase'
 
 const BRANCHES = ['CSE', 'IT', 'ECE', 'Mechanical', 'Civil', 'Electrical', 'Other']
 const YEARS = ['1st year', '2nd year', '3rd year', '4th year']
+
+// Secret code needed to sign up as staff or admin (change it here anytime)
+const ACCESS_CODE = 'MIND2026'
+
+// Votes needed to auto-mark a complaint Urgent
+const URGENT_VOTES = 3
+
+// One timeline entry (who did what, when)
+const entry = (by, text) => ({ t: Date.now(), by: by || 'Someone', text })
+const stamp = (t) =>
+  new Date(t).toLocaleString('en-IN', { day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' })
+
+// Update a complaint, add a timeline line, and (optionally) notify the student
+const change = (c, profile, uid, d, text, notify = true) =>
+  updateDoc(doc(db, 'complaints', c.id), {
+    ...d,
+    timeline: arrayUnion(entry(profile.name, text)),
+    ...(notify ? { updatedAt: Date.now(), updatedBy: uid, updateNote: text } : {}),
+  })
+
+// Make phone photos smaller before upload (faster on slow networks). Falls back to the original file.
+async function shrink(file, max = 1280) {
+  try {
+    const url = URL.createObjectURL(file)
+    const img = await new Promise((res, rej) => {
+      const i = new Image()
+      i.onload = () => res(i)
+      i.onerror = rej
+      i.src = url
+    })
+    const r = Math.min(1, max / Math.max(img.width, img.height))
+    const cv = document.createElement('canvas')
+    cv.width = Math.round(img.width * r)
+    cv.height = Math.round(img.height * r)
+    cv.getContext('2d').drawImage(img, 0, 0, cv.width, cv.height)
+    URL.revokeObjectURL(url)
+    const blob = await new Promise((res) => cv.toBlob(res, 'image/jpeg', 0.8))
+    return blob && blob.size < file.size ? new File([blob], 'photo.jpg', { type: 'image/jpeg' }) : file
+  } catch (_) {
+    return file
+  }
+}
+
+// Shows a friendly screen instead of a blank page if something unexpected breaks
+class Safe extends Component {
+  state = { bad: false }
+  static getDerivedStateFromError() { return { bad: true } }
+  render() {
+    if (!this.state.bad) return this.props.children
+    return (
+      <div className="verify">
+        <div className="formbox">
+          <h2>Something went wrong</h2>
+          <p className="sub">Please reload the page. Your complaints are safe.</p>
+          <button onClick={() => window.location.reload()}>Reload</button>
+        </div>
+      </div>
+    )
+  }
+}
+
+// Live list of all user profiles (admin uses it to assign staff and see logins)
+function useUsers() {
+  const [list, setList] = useState([])
+  useEffect(
+    () =>
+      onSnapshot(
+        query(collection(db, 'users')),
+        (s) => setList(s.docs.map((d) => ({ uid: d.id, ...d.data() }))),
+        () => {}
+      ),
+    []
+  )
+  return list
+}
+
+// Search box + status chips + grid of cards (used by student tabs)
+function Browse({ list, empty, children }) {
+  const [q, setQ] = useState('')
+  const [fStatus, setFStatus] = useState('All')
+  const text = q.trim().toLowerCase()
+  const shown = list
+    .filter((c) => fStatus === 'All' || c.status === fStatus)
+    .filter((c) => !text || `${c.description} ${c.locationText} ${c.category}`.toLowerCase().includes(text))
+    .sort((a, b) => (b.urgent ? 1 : 0) - (a.urgent ? 1 : 0))
+  return (
+    <>
+      <div className="toolbar one">
+        <input type="search" placeholder="Search place or problem…" value={q} onChange={(e) => setQ(e.target.value)} />
+      </div>
+      <div className="chips">
+        {['All', ...STATUSES.filter((x) => x !== 'Submitted')].map((x) => (
+          <button key={x} className={`chip ${fStatus === x ? 'on' : ''}`} onClick={() => setFStatus(x)}>{x}</button>
+        ))}
+      </div>
+      {shown.length === 0 && <p className="empty">{empty}</p>}
+      <div className="grid">{shown.map((c) => children(c))}</div>
+    </>
+  )
+}
 
 // Friendly messages instead of raw Firebase errors
 const nice = (x) =>
@@ -74,6 +177,8 @@ function Track({ status }) {
 
 // who = show reporter details (for staff and admin only)
 function Card({ c, who, children }) {
+  const votes = (c.upvotes || []).length
+  const steps = c.timeline || []
   return (
     <article className="card">
       <header>
@@ -95,6 +200,15 @@ function Card({ c, who, children }) {
         <span>{c.department} · {when(c)}</span>
         {c.reopenCount > 0 && <span>Reopened {c.reopenCount}x</span>}
       </p>
+      {(c.assignedTo || votes > 0) && (
+        <p className="meta">
+          <span>{c.assignedTo ? `🔧 Assigned to ${c.assignedTo}` : ''}</span>
+          {votes > 0 && <span>👍 {votes} {votes === 1 ? 'student has' : 'students have'} this problem</span>}
+        </p>
+      )}
+      {c.reopenReason && c.status !== 'Verified' && (
+        <p className="reason"><b>Reopened because:</b> {c.reopenReason}</p>
+      )}
       {who && c.reporterName && (
         <p className="meta">
           <span>👤 {c.reporterName}{c.reporterRoll ? ` · ${c.reporterRoll}` : ''}</span>
@@ -105,6 +219,16 @@ function Card({ c, who, children }) {
         <figure><img src={c.photoURL} alt="Before" /><figcaption>Before</figcaption></figure>
         {c.afterPhotoURL && <figure><img src={c.afterPhotoURL} alt="After" /><figcaption>After</figcaption></figure>}
       </div>
+      {steps.length > 0 && (
+        <details className="timeline">
+          <summary>Timeline ({steps.length})</summary>
+          <ul>
+            {steps.map((x, k) => (
+              <li key={k}><span>{stamp(x.t)}</span> <b>{x.by}</b>: {x.text}</li>
+            ))}
+          </ul>
+        </details>
+      )}
       {children}
     </article>
   )
@@ -114,7 +238,7 @@ function Login() {
   const [signup, setSignup] = useState(false)
   const [f, setF] = useState({
     name: '', email: '', password: '', role: 'student', department: Object.values(DEPT)[0],
-    roll: '', phone: '', branch: BRANCHES[0], year: YEARS[0],
+    roll: '', phone: '', branch: BRANCHES[0], year: YEARS[0], code: '',
   })
   const [err, setErr] = useState('')
   const [info, setInfo] = useState('')
@@ -129,6 +253,11 @@ function Login() {
     setBusy(true)
     try {
       if (signup) {
+        if (!isStudent && f.code.trim() !== ACCESS_CODE) {
+          setErr('Wrong access code. Ask your admin for the staff/admin code.')
+          setBusy(false)
+          return
+        }
         const { user } = await createUserWithEmailAndPassword(auth, f.email, f.password)
         const data = {
           name: f.name.trim(), email: f.email, role: f.role,
@@ -196,6 +325,11 @@ function Login() {
                   <option value="staff">Maintenance staff</option>
                   <option value="admin">Admin / warden</option>
                 </select>
+              </Field>
+            )}
+            {signup && !isStudent && (
+              <Field label="Staff / Admin access code">
+                <input type="password" placeholder="Secret code" value={f.code} onChange={set('code')} required />
               </Field>
             )}
             {signup && f.role === 'staff' && (
@@ -280,32 +414,62 @@ function VerifyEmail({ user, onDone }) {
   )
 }
 
-function Report({ user, profile, done }) {
+function Report({ user, profile, done, similar, vote }) {
   const [photo, setPhoto] = useState(null)
   const [category, setCategory] = useState(CATEGORIES[0])
   const [place, setPlace] = useState('')
   const [text, setText] = useState('')
   const [pos, setPos] = useState(null)
   const [busy, setBusy] = useState(false)
+  const [loadingLoc, setLoadingLoc] = useState(false)
+  const [locErr, setLocErr] = useState('')
 
-  const getPos = () =>
-    navigator.geolocation?.getCurrentPosition(
-      (p) => setPos({ lat: p.coords.latitude, lng: p.coords.longitude }),
-      () => alert('Allow location access in your browser, then tap "Get location".')
+  // Try accurate GPS first; if it times out (laptops have no GPS), fall back to Wi-Fi/network location
+  function getPos() {
+    if (!navigator.geolocation) return setLocErr('This browser does not support location.')
+    setLoadingLoc(true)
+    setLocErr('')
+    const ok = (p) => {
+      setPos({ lat: p.coords.latitude, lng: p.coords.longitude, acc: p.coords.accuracy })
+      setLoadingLoc(false)
+    }
+    const fail = (e) => {
+      setLoadingLoc(false)
+      setLocErr(
+        e.code === 1
+          ? 'Location is blocked. Tap the 🔒 icon next to the address bar, set Location to Allow, then tap "Get location".'
+          : e.code === 2
+            ? 'Location not available. Turn on GPS / Wi-Fi and try again.'
+            : 'Location timed out. Try again near a window, or turn on Wi-Fi.'
+      )
+    }
+    navigator.geolocation.getCurrentPosition(
+      ok,
+      (e) => {
+        if (e.code === 1) return fail(e)
+        navigator.geolocation.getCurrentPosition(ok, fail, { enableHighAccuracy: false, timeout: 15000, maximumAge: 60000 })
+      },
+      { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
     )
+  }
   useEffect(() => { getPos() }, [])
+
+  // Open complaints from OTHER students in the same category (to avoid duplicates)
+  const like = similar.filter((c) => c.category === category).slice(0, 3)
 
   async function submit(e) {
     e.preventDefault()
     if (!photo) return alert('Add a photo of the problem first.')
     setBusy(true)
     try {
-      const photoURL = await uploadPhoto(photo)
+      const photoURL = await uploadPhoto(await shrink(photo))
       await addDoc(collection(db, 'complaints'), {
         category, department: DEPT[category], description: text, locationText: place,
         lat: pos?.lat ?? null, lng: pos?.lng ?? null, photoURL, afterPhotoURL: null,
         status: 'Assigned', reopenCount: 0, createdBy: user.uid, createdAt: serverTimestamp(),
         reporterName: profile.name || '', reporterRoll: profile.roll || '', reporterPhone: profile.phone || '',
+        upvotes: [], assignedTo: null, assignedUid: null,
+        timeline: [entry(profile.name, `Reported and sent to ${DEPT[category]}`)],
       })
       done()
     } catch (x) {
@@ -323,63 +487,157 @@ function Report({ user, profile, done }) {
       <select value={category} onChange={(e) => setCategory(e.target.value)}>
         {CATEGORIES.map((c) => <option key={c}>{c}</option>)}
       </select>
+      {like.length > 0 && (
+        <div className="similar span2">
+          <b>Already reported by others. Same problem? Tap "Me too" instead of a new complaint.</b>
+          {like.map((c) => {
+            const voted = (c.upvotes || []).includes(user.uid)
+            return (
+              <div className="srow" key={c.id}>
+                <span>{c.locationText} · {(c.description || '').slice(0, 45)}</span>
+                <button type="button" className={voted ? 'ok' : 'ghost'} onClick={() => vote(c)}>
+                  {voted ? 'Voted ✓' : `Me too (${(c.upvotes || []).length})`}
+                </button>
+              </div>
+            )
+          })}
+        </div>
+      )}
       <input placeholder="Where? (e.g. Hostel B, 2nd floor washroom)" value={place} onChange={(e) => setPlace(e.target.value)} required />
       <textarea placeholder="What is wrong?" value={text} onChange={(e) => setText(e.target.value)} required />
       <p className="meta span2">
-        <span>{pos ? '📍 Location captured' : 'Location not captured'}</span>
-        <button type="button" className="link" onClick={getPos}>Get location</button>
+        <span>
+          {loadingLoc ? '📡 GPS fetch ho raha hai...' : pos ? `📍 Location saved${pos.acc ? ` (±${Math.round(pos.acc)} m)` : ''}` : 'Location not captured'}
+        </span>
+        <button type="button" className="link" disabled={loadingLoc || busy} onClick={getPos}>
+          {pos ? 'Refresh location' : 'Get location'}
+        </button>
       </p>
-      <button className="span2" disabled={busy}>{busy ? 'Sending…' : 'Send complaint'}</button>
+      {locErr && <p className="err span2">{locErr}</p>}
+      <button className="span2" disabled={busy || loadingLoc}>{busy ? 'Sending…' : 'Send complaint'}</button>
     </form>
   )
 }
 
 function Student({ user, profile }) {
   const [tab, setTab] = useState('report')
-  const list = useComplaints(() => query(collection(db, 'complaints'), where('createdBy', '==', user.uid)))
-  const upd = (c, d) => updateDoc(doc(db, 'complaints', c.id), d)
+  const all = useComplaints(() => query(collection(db, 'complaints')))
+  const mine = all.filter((c) => c.createdBy === user.uid)
+  const others = all.filter((c) => c.createdBy !== user.uid)
+  const openOthers = others.filter((c) => c.status !== 'Verified')
+
+  // Notification banner: staff/admin changed one of my complaints and I have not seen it yet
+  const key = `cf_seen_${user.uid}`
+  const readSeen = () => { try { return JSON.parse(localStorage.getItem(key)) || {} } catch (_) { return {} } }
+  const [seen, setSeen] = useState(readSeen)
+  const news = mine.filter((c) => c.updatedAt && c.updatedBy !== user.uid && c.updatedAt > (seen[c.id] || 0))
+  function dismiss() {
+    const n = { ...seen }
+    news.forEach((c) => { n[c.id] = c.updatedAt })
+    setSeen(n)
+    try { localStorage.setItem(key, JSON.stringify(n)) } catch (_) { /* ignore */ }
+  }
+
+  async function vote(c) {
+    const has = (c.upvotes || []).includes(user.uid)
+    const count = (c.upvotes || []).length + (has ? -1 : 1)
+    const d = { upvotes: has ? arrayRemove(user.uid) : arrayUnion(user.uid) }
+    if (!has && count >= URGENT_VOTES && !c.urgent) {
+      d.urgent = true
+      d.timeline = arrayUnion(entry('System', `Auto-marked Urgent (${count} students have this problem)`))
+    }
+    try { await updateDoc(doc(db, 'complaints', c.id), d) } catch (x) { alert(x.message) }
+  }
+
+  const verify = (c) => change(c, profile, user.uid, { status: 'Verified' }, 'Verified the fix. Complaint closed.', false).catch((x) => alert(x.message))
+  function reopen(c) {
+    const why = window.prompt('Why are you reopening this? (required)')
+    if (!why || !why.trim()) return
+    change(
+      c, profile, user.uid,
+      { status: 'In Progress', reopenCount: (c.reopenCount || 0) + 1, reopenReason: why.trim(), resolvedAt: null },
+      `Reopened: ${why.trim()}`, false
+    ).catch((x) => alert(x.message))
+  }
+
   return (
     <>
+      {news.length > 0 && (
+        <div className="banner">
+          <div>
+            {news.slice(0, 3).map((c) => (
+              <p key={c.id}>🔔 <b>{c.category}</b> ({c.locationText}): {c.updateNote}</p>
+            ))}
+            {news.length > 3 && <p>…and {news.length - 3} more</p>}
+          </div>
+          <button className="ghost" onClick={dismiss}>OK</button>
+        </div>
+      )}
       <nav className="tabs">
         <button className={tab === 'report' ? 'on' : ''} onClick={() => setTab('report')}>New complaint</button>
-        <button className={tab === 'mine' ? 'on' : ''} onClick={() => setTab('mine')}>My complaints ({list.length})</button>
+        <button className={tab === 'mine' ? 'on' : ''} onClick={() => setTab('mine')}>My complaints ({mine.length})</button>
+        <button className={tab === 'feed' ? 'on' : ''} onClick={() => setTab('feed')}>Campus feed ({openOthers.length})</button>
       </nav>
-      {tab === 'report' ? (
-        <Report user={user} profile={profile} done={() => setTab('mine')} />
-      ) : list.length === 0 ? (
-        <p className="empty">No complaints yet. Report your first problem.</p>
-      ) : (
-        <div className="grid">
-          {list.map((c) => (
-            <Card key={c.id} c={c}>
-              {c.status === 'Resolved' && (
-                <div className="actions">
-                  <button className="ok" onClick={() => upd(c, { status: 'Verified' })}>Verify fix</button>
-                  <button className="danger" onClick={() => upd(c, { status: 'In Progress', reopenCount: (c.reopenCount || 0) + 1 })}>Reopen</button>
-                </div>
-              )}
-            </Card>
-          ))}
-        </div>
+      {tab === 'report' && (
+        <Report user={user} profile={profile} done={() => setTab('mine')} similar={openOthers} vote={vote} />
+      )}
+      {tab === 'mine' && (
+        mine.length === 0 ? (
+          <p className="empty">No complaints yet. Report your first problem.</p>
+        ) : (
+          <Browse list={mine} empty="No complaints match.">
+            {(c) => (
+              <Card key={c.id} c={c}>
+                {c.status === 'Resolved' && (
+                  <div className="actions">
+                    <button className="ok" onClick={() => verify(c)}>Verify fix</button>
+                    <button className="danger" onClick={() => reopen(c)}>Reopen</button>
+                  </div>
+                )}
+              </Card>
+            )}
+          </Browse>
+        )
+      )}
+      {tab === 'feed' && (
+        others.length === 0 ? (
+          <p className="empty">No complaints from other students yet.</p>
+        ) : (
+          <Browse list={others} empty="No complaints match.">
+            {(c) => {
+              const voted = (c.upvotes || []).includes(user.uid)
+              return (
+                <Card key={c.id} c={c}>
+                  {c.status !== 'Verified' && (
+                    <button className={voted ? 'ok' : 'ghost'} onClick={() => vote(c)}>
+                      {voted ? 'Voted ✓ (tap to undo)' : '👍 Me too, I face this problem'}
+                    </button>
+                  )}
+                </Card>
+              )
+            }}
+          </Browse>
+        )
       )}
     </>
   )
 }
 
-function Staff({ profile }) {
+function Staff({ user, profile }) {
   const list = useComplaints(() => query(collection(db, 'complaints'), where('department', '==', profile.department)))
   const [busy, setBusy] = useState('')
-  const upd = (c, d) => updateDoc(doc(db, 'complaints', c.id), d)
+  const act = (c, d, text) => change(c, profile, user.uid, d, text).catch((x) => alert(x.message))
   async function finish(c, file) {
     if (!file) return
     setBusy(c.id)
     try {
-      await upd(c, { afterPhotoURL: await uploadPhoto(file), status: 'Resolved' })
+      await change(c, profile, user.uid, { afterPhotoURL: await uploadPhoto(await shrink(file)), status: 'Resolved', resolvedAt: Date.now() }, 'Fixed. After photo uploaded. Please verify.')
     } catch (x) {
       alert(x.message)
     }
     setBusy('')
   }
+  const sorted = [...list].sort((a, b) => (b.assignedUid === user.uid ? 1 : 0) - (a.assignedUid === user.uid ? 1 : 0) || (b.urgent ? 1 : 0) - (a.urgent ? 1 : 0))
   return (
     <div>
       <div className="head">
@@ -388,9 +646,9 @@ function Staff({ profile }) {
       </div>
       {list.length === 0 && <p className="empty">No tasks yet. New complaints for your department appear here.</p>}
       <div className="grid">
-        {list.map((c) => (
+        {sorted.map((c) => (
           <Card key={c.id} c={c} who>
-            {c.status === 'Assigned' && <button onClick={() => upd(c, { status: 'In Progress' })}>Start work</button>}
+            {c.status === 'Assigned' && <button onClick={() => act(c, { status: 'In Progress' }, 'Work started')}>Start work</button>}
             {c.status === 'In Progress' && (
               <label className="btn">
                 {busy === c.id ? 'Uploading…' : 'Upload after photo'}
@@ -404,13 +662,15 @@ function Staff({ profile }) {
   )
 }
 
-function Admin() {
+function Admin({ user, profile }) {
   const list = useComplaints(() => query(collection(db, 'complaints')))
+  const users = useUsers()
+  const staff = users.filter((x) => x.role === 'staff')
   const [fStatus, setFStatus] = useState('All')
   const [fCat, setFCat] = useState('')
   const [q, setQ] = useState('')
   const depts = [...new Set(Object.values(DEPT))]
-  const upd = (c, d) => updateDoc(doc(db, 'complaints', c.id), d).catch((x) => alert(x.message))
+  const act = (c, d, text, notify) => change(c, profile, user.uid, d, text, notify).catch((x) => alert(x.message))
   const remove = async (c) => {
     if (!window.confirm('Delete this complaint permanently?')) return
     try { await deleteDoc(doc(db, 'complaints', c.id)) } catch (x) { alert(x.message) }
@@ -419,12 +679,17 @@ function Admin() {
   const now = Date.now() / 1000
   const open = list.filter((c) => c.status !== 'Verified')
   const stale = open.filter((c) => c.createdAt && now - c.createdAt.seconds > 86400)
+  const fixed = list.filter((c) => c.resolvedAt && c.createdAt?.seconds)
+  const avgHours = fixed.length
+    ? fixed.reduce((t, c) => t + (c.resolvedAt / 1000 - c.createdAt.seconds), 0) / fixed.length / 3600
+    : null
   const stats = [
     ['Total', list.length],
     ['Open', open.length],
     ['Waiting for student check', list.filter((c) => c.status === 'Resolved').length],
     ['Verified', list.length - open.length],
     ['Open over 24 hours', stale.length],
+    ['Avg fix time', avgHours === null ? '–' : avgHours < 1 ? `${Math.max(1, Math.round(avgHours * 60))}m` : `${avgHours.toFixed(1)}h`],
   ]
   const byDept = depts.map((d) => [d, open.filter((c) => c.department === d).length])
   const max = Math.max(1, ...byDept.map((x) => x[1]))
@@ -436,11 +701,20 @@ function Admin() {
     .filter((c) => !text || `${c.description} ${c.locationText} ${c.category} ${c.reporterName || ''} ${c.reporterRoll || ''}`.toLowerCase().includes(text))
     .sort((a, b) => (b.urgent ? 1 : 0) - (a.urgent ? 1 : 0))
 
+  function assign(c, uid) {
+    const person = staff.find((x) => x.uid === uid)
+    if (!person) return act(c, { assignedTo: null, assignedUid: null }, 'Assignment removed', false)
+    act(c, { assignedTo: person.name, assignedUid: uid }, `Assigned to ${person.name}`)
+  }
+  function route(c, dept) {
+    act(c, { department: dept, assignedTo: null, assignedUid: null }, `Routed to ${dept}`)
+  }
+
   return (
     <div>
       <div className="head">
         <h2>Admin dashboard</h2>
-        <p>See everything, route it, and mark what is urgent.</p>
+        <p>See everything, route it, assign staff, and mark what is urgent.</p>
       </div>
       <div className="stats">
         {stats.map(([k, v]) => (
@@ -458,6 +732,20 @@ function Admin() {
           </div>
         ))}
       </section>
+
+      <details className="panel">
+        <summary><b>People and last login ({users.length})</b></summary>
+        <div className="people">
+          {[...users]
+            .sort((a, b) => (b.lastLogin?.seconds || 0) - (a.lastLogin?.seconds || 0))
+            .map((p) => (
+              <p key={p.uid}>
+                <span><b>{p.name}</b> · {p.role}{p.department ? ` · ${p.department}` : ''}</span>
+                <span>{p.lastLogin?.seconds ? stamp(p.lastLogin.seconds * 1000) : 'never'}{p.loginCount ? ` · ${p.loginCount} logins` : ''}</span>
+              </p>
+            ))}
+        </div>
+      </details>
 
       <div className="toolbar">
         <input type="search" placeholder="Search place, problem, student…" value={q} onChange={(e) => setQ(e.target.value)} />
@@ -477,10 +765,16 @@ function Admin() {
         {shown.map((c) => (
           <Card key={c.id} c={c} who>
             <div className="admin-actions">
-              <select value={c.department} onChange={(e) => upd(c, { department: e.target.value })} aria-label="Route to department">
+              <select value={c.department} onChange={(e) => route(c, e.target.value)} aria-label="Route to department">
                 {depts.map((d) => <option key={d} value={d}>Route to: {d}</option>)}
               </select>
-              <button className="ghost" onClick={() => upd(c, { urgent: !c.urgent })}>{c.urgent ? 'Remove urgent' : 'Mark urgent'}</button>
+              <select value={c.assignedUid || ''} onChange={(e) => assign(c, e.target.value)} aria-label="Assign to staff">
+                <option value="">Assign to staff…</option>
+                {staff.filter((x) => x.department === c.department).map((x) => (
+                  <option key={x.uid} value={x.uid}>Assign to: {x.name}</option>
+                ))}
+              </select>
+              <button className="ghost" onClick={() => act(c, { urgent: !c.urgent }, c.urgent ? 'Urgent removed' : 'Marked urgent', false)}>{c.urgent ? 'Remove urgent' : 'Mark urgent'}</button>
               <button className="danger" onClick={() => remove(c)}>Delete</button>
             </div>
           </Card>
@@ -490,7 +784,7 @@ function Admin() {
   )
 }
 
-export default function App() {
+function Main() {
   const [user, setUser] = useState(undefined)
   const [profile, setProfile] = useState(null)
   const [, force] = useState(0)
@@ -500,6 +794,14 @@ export default function App() {
     if (!user) return
     return onSnapshot(doc(db, 'users', user.uid), (s) => setProfile(s.exists() ? s.data() : null))
   }, [user])
+
+  // Record one login per visit (last login time + count)
+  const logged = useRef('')
+  useEffect(() => {
+    if (!user || !profile || logged.current === user.uid) return
+    logged.current = user.uid
+    updateDoc(doc(db, 'users', user.uid), { lastLogin: serverTimestamp(), loginCount: increment(1) }).catch(() => {})
+  }, [user, profile])
 
   if (user === undefined) return <p className="empty">Loading…</p>
   if (!user) return <Login />
@@ -523,8 +825,16 @@ export default function App() {
         <button className="ghost" onClick={() => signOut(auth)}>Log out</button>
       </header>
       <main className="page">
-        {profile.role === 'student' ? <Student user={user} profile={profile} /> : profile.role === 'staff' ? <Staff profile={profile} /> : <Admin />}
+        {profile.role === 'student' ? <Student user={user} profile={profile} /> : profile.role === 'staff' ? <Staff user={user} profile={profile} /> : <Admin user={user} profile={profile} />}
       </main>
     </>
+  )
+}
+
+export default function App() {
+  return (
+    <Safe>
+      <Main />
+    </Safe>
   )
 }

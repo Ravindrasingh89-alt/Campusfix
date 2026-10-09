@@ -234,3 +234,24 @@ form { display: grid; gap: 12px; }
   button, .btn { transition: filter 0.15s, opacity 0.15s; }
   button:active, .btn:active { opacity: 0.85; }
 }
+
+/* --- v3 additions: reopen reason, timeline, votes, banner, similar --- */
+.toolbar.one { grid-template-columns: 1fr; }
+.reason { background: var(--bad-soft); color: var(--bad); padding: 8px 10px; border-radius: 10px; font-size: 13.5px; }
+.timeline { font-size: 13px; color: var(--muted); border-top: 1px dashed var(--line); padding-top: 8px; }
+.timeline summary { cursor: pointer; font-weight: 600; color: var(--accent); }
+.timeline ul { list-style: none; margin: 8px 0 0; padding: 0; display: grid; gap: 6px; }
+.timeline li span { color: var(--muted); font-size: 12px; }
+.timeline li b { color: var(--ink); }
+.banner { display: flex; justify-content: space-between; align-items: center; gap: 12px; background: var(--warn-soft); color: var(--warn); border-radius: 14px; padding: 12px 14px; margin-bottom: 14px; font-size: 14px; }
+.banner p { margin: 2px 0; }
+.banner button { width: auto; padding: 8px 16px; }
+.similar { background: var(--accent-soft); border-radius: 14px; padding: 12px; display: grid; gap: 8px; font-size: 14px; }
+.srow { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
+.srow span { overflow-wrap: anywhere; }
+.srow button { width: auto; padding: 8px 14px; font-size: 14px; flex-shrink: 0; }
+
+.panel summary { cursor: pointer; font-size: 16px; }
+.people { margin-top: 10px; display: grid; gap: 6px; font-size: 13.5px; }
+.people p { display: flex; justify-content: space-between; gap: 10px; flex-wrap: wrap; border-bottom: 1px dashed var(--line); padding-bottom: 6px; }
+.people span:last-child { color: var(--muted); }
