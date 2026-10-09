@@ -20,12 +20,13 @@ const app = initializeApp(firebaseConfig)
 export const auth = getAuth(app)
 export const db = getFirestore(app)
 
-export const CATEGORIES = ['Electrical', 'Plumbing', 'Civil', 'Housekeeping']
+export const CATEGORIES = ['Electrical', 'Plumbing', 'Civil', 'Housekeeping', 'Other']
 export const DEPT = {
   Electrical: 'Electrical Dept',
   Plumbing: 'Plumbing Dept',
   Civil: 'Civil Dept',
   Housekeeping: 'Housekeeping Dept',
+  Other: 'Other Dept',
 }
 export const STATUSES = ['Submitted', 'Assigned', 'In Progress', 'Resolved', 'Verified']
 
